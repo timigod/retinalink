@@ -63,7 +63,7 @@ public final class ReceiverCoordinator: ObservableObject {
                                     panelIsHiDPI: panel.isHiDPI)
         let size = CGDisplayScreenSize(panel.id)
         let hello = ReceiverHello(name: hostName, panelPixelWidth: panel.pixelWidth, panelPixelHeight: panel.pixelHeight,
-                                  cursorPort: nil, supportsLossless: true,
+                                  cursorPort: nil, losslessVersion: LosslessFrame.protocolVersion,
                                   supportedProfiles: HEVCDecoder.supportedHardwareProfiles(),
                                   physicalWidthMm: size.width > 0 ? size.width : nil,
                                   physicalHeightMm: size.height > 0 ? size.height : nil, panelIsHiDPI: panel.isHiDPI)

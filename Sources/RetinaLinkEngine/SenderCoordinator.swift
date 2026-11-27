@@ -138,6 +138,18 @@ public final class SenderCoordinator: ObservableObject {
             }
             stats.logicalWidth = presets[index].logicalWidth
             stats.logicalHeight = presets[index].logicalHeight
+            let preset = presets[index]
+            Task { [weak self, weak frames = frameSender] in
+                guard let self, let frames, self.frameSender === frames,
+                      self.display.preset == preset else { return }
+                do {
+                    try await self.capture.updateCaptureSize(width: preset.pixelWidth, height: preset.pixelHeight)
+                } catch {
+                    guard self.frameSender === frames else { return }
+                    self.stopStream()
+                    self.state = .error(error.localizedDescription)
+                }
+            }
         } catch {
             stopStream()
             state = .error(error.localizedDescription)
@@ -266,7 +278,7 @@ public final class SenderCoordinator: ObservableObject {
             startedCandidate = candidate
             session.configureCursor(port: hello.cursorPort)
             session.send(.senderConfig(config))
-            frameSender.attach(session, kind: candidate.kind, receiverSupportsLossless: hello.supportsLossless == true)
+            frameSender.attach(session, kind: candidate.kind, receiverSupportsLossless: hello.supportsProgressiveLossless)
             return
         }
         let ladder = HiDPIPreset.ladder(forPanelWidth: Int(width), height: Int(height),
@@ -338,14 +350,16 @@ public final class SenderCoordinator: ObservableObject {
         }
         session.configureCursor(port: hello.cursorPort)
         session.send(.senderConfig(config))
-        frames.attach(session, kind: candidate.kind, receiverSupportsLossless: hello.supportsLossless == true)
+        frames.attach(session, kind: candidate.kind, receiverSupportsLossless: hello.supportsProgressiveLossless)
         cursor.start(displayID: displayID, onImage: { [weak frames] in frames?.sendCursorImage($0) },
                      onPosition: { [weak frames] in frames?.sendCursorPosition($0) })
         Task { [weak self, weak frames, capture] in
             guard let self, let frames, frameSender === frames else { return }
             do {
+                let preset = display.preset ?? ladder[index]
                 try await capture.start(displayID: displayID, width: Int(width), height: Int(height),
-                                        cursorMode: config.cursorMode, onFrame: { [weak frames] surface, time, dirty in
+                                        cursorMode: config.cursorMode, captureWidth: preset.pixelWidth,
+                                        captureHeight: preset.pixelHeight, onFrame: { [weak frames] surface, time, dirty in
                     frames?.submit(surface, captureTimeNs: time, dirtyRects: dirty)
                 }, onError: { [weak self, weak frames] error in
                     DispatchQueue.main.async {

@@ -1,6 +1,6 @@
 # RetinaLink Architecture Specification
 
-Native macOS display bridge that turns any Mac into a pixel-perfect extended display for another Mac. The sender creates a HiDPI virtual display, captures it at the receiver panel's exact native pixel size, and streams it over the best available link (direct Thunderbolt/USB-C cable, wired LAN or Wi-Fi). Motion travels as hardware HEVC; settled content and typing are corrected to bit-exact lossless pixels. This bypasses AirPlay's `3840×2160` 4:2:0 ceiling and its compression blur on text.
+Native macOS display bridge that turns any Mac into a pixel-perfect extended display for another Mac. The sender creates a HiDPI virtual display, captures its native backing raster and streams at the receiver panel's exact native pixel size, and streams it over the best available link (direct Thunderbolt/USB-C cable, wired LAN or Wi-Fi). Motion travels as hardware HEVC; settled content and typing are corrected to bit-exact lossless pixels. This bypasses AirPlay's `3840×2160` 4:2:0 ceiling and its compression blur on text.
 
 ## 1. Supported Hardware
 
@@ -36,12 +36,13 @@ scripts/
 
 ```text
 CGVirtualDisplay (hiDPI=1, dynamic logical size, stable vendor/product/serial)
-  -> ScreenCaptureKit SCStream (locked to receiver native pixels, e.g. 4480x2520 or 3840x2160, 60fps, Display P3, 32BGRA)
+  -> ScreenCaptureKit SCStream (virtual backing pixels, .best, 60fps, Display P3, 32BGRA)
+  -> Metal-backed LanczosScaler (scaled presets only, output at the receiver's native raster)
   -> Backpressure gate (drop before encode at the RTT-aware limit of 4–6 unacknowledged frames)
   -> VideoToolbox VTCompressionSession (negotiated HW HEVC profile, RealTime=true, LowLatencyRateControl=true, AllowFrameReordering=false)
-  -> Lossless settle: dirty-rect diff against the last exact frame -> LZ4 tiles (message 0x0A) once motion stops or while typing
+  -> Lossless settle: 32 hashed tiles with adaptive LZ4/LZFSE during rest, LZ4 dirty rectangles while typing
   -> Network.framework TCP (noDelay=true) over highest-ranked route (Direct Cable > Wired LAN > Wi-Fi)
-  -> VideoToolbox VTDecompressionSession (IOSurface + Metal compatible) + lossless tile patching onto the presented surface
+  -> VideoToolbox VTDecompressionSession (IOSurface + Metal compatible) or a completed lossless staging snapshot
   -> DisplayScanout switches the chosen ReceiverDisplay to its native raster at 1x or 2x
   -> Fullscreen borderless receiver window (direct Display P3 IOSurface on CALayer, AV sample-buffer / Metal alternatives)
   + Parallel 120Hz UDP cursor channel (NSEvent.mouseLocation + NSCursor.currentSystem hash cache -> CALayer cursor overlay)
@@ -49,7 +50,11 @@ CGVirtualDisplay (hiDPI=1, dynamic logical size, stable vendor/product/serial)
 
 The media queue handles framing, frame delivery, and ACKs. VideoToolbox encode and
 decode each have their own queue. AppKit receives the latest decoded frame for
-presentation and publishes sender statistics on a timer.
+presentation and publishes sender statistics on a timer. On a 1:1 preset the
+capture surface passes through directly. At other sizes, Lanczos scales from
+the actual captured buffer into a pooled Display P3 BGRA IOSurface. Dirty
+rectangles are mapped in output pixels, expanded for the filter, and clamped.
+An ambiguous capture geometry falls back to a motion frame.
 
 The pipeline opens four slots for Thunderbolt below 10 ms RTT, five slots
 through 25 ms, and six above 25 ms. RTT samples are smoothed per session.
@@ -64,12 +69,12 @@ For a `4480 × 2520` (4.5K 16:9) HiDPI panel:
 2. `1920 × 1080` — "Large" (`3840×2160` backing)
 3. `2048 × 1152` — "Medium" (`4096×2304` backing)
 4. `2240 × 1260` — "Default" (`4480×2520` backing, `isNativeDefault = true`)
-5. `2560 × 1440` — "Compact" (`5120×2880` backing, GPU-downscaled by SCStream to `4480×2520`)
-6. `2880 × 1620` — "More Space" (`5760×3240` backing, GPU-downscaled by SCStream to `4480×2520`)
+5. `2560 × 1440` — "Compact" (`5120×2880` backing, GPU-downscaled by Lanczos to `4480×2520`)
+6. `2880 × 1620` — "More Space" (`5760×3240` backing, GPU-downscaled by Lanczos to `4480×2520`)
 
 The sender remembers the chosen preset per receiver and restores it on the next connection.
 
-Changing preset updates `CGVirtualDisplay.applySettings(...)` in place while `SCStream` output dimensions remain locked to `panelPixelWidth × panelPixelHeight`: **no encoder/decoder restart, no black flash, no window scatter**.
+Changing preset updates `CGVirtualDisplay.applySettings(...)` and `SCStream.updateConfiguration` in place. The stream captures the new native backing raster. The encoder and receiver continue at `panelPixelWidth × panelPixelHeight`.
 
 ### 3.3 Wire Protocol (`WireProtocol.swift`)
 
@@ -91,9 +96,11 @@ Message types:
 - `0x07 heartbeat` (Binary 16B: `timestampNs: UInt64`, `isReply: UInt8`, `pad: 7B`)
 - `0x08 requestKeyframe` (empty)
 - `0x09 disconnect` (UTF-8 JSON `DisconnectReason`)
-- `0x0A losslessFrame` (Binary: `frameID: UInt64`, `captureTimeNs: UInt64`, `baseFrameID: UInt64` [`0` = full-frame settle; non-zero = incremental dirty-rect patch on top of `baseFrameID`], `width: UInt16`, `height: UInt16`, `algorithm: UInt8` [`0` = LZ4, `1` = LZFSE], `patchCount: UInt8` [`1..64`], then `patchCount` patches of `x: UInt16`, `y: UInt16`, `width: UInt16`, `height: UInt16`, `length: UInt32`, `compressedBytes` holding the exact BGRA pixels of that rectangle). Patches must lie inside `width × height` and be non-empty. The receiver applies them onto the presented surface, so static content is bit-exact (0/255 error) regardless of the HEVC profile.
-  - **Full-frame settle** (`baseFrameID = 0`): sent once motion stops. The frame is split into 4 horizontal bands that are compressed in parallel (and decompressed in parallel on the receiver). LZ4 is tried first within a 12 MB budget (4.5 MB on Wi-Fi or a USB 2.0-speed direct cable); if it does not fit, LZFSE is tried within 8 MB (4.5 MB on slow links). If neither fits, the frame stays HEVC.
-  - **Incremental dirty-rect patch** (`baseFrameID` = the last lossless frame): sent while typing, LZ4 only, when the dirty rectangles cover at most 15% of the frame (and at most 1.8 MP) and compress into 512 KB (512,000 bytes).
+- `0x0A losslessFrame` (big-endian `frameID: UInt64`, `captureTimeNs: UInt64`, `baseFrameID: UInt64`, `width: UInt16`, `height: UInt16`, `flags: UInt8`, `patchCount: UInt8`). Flag bit 0 presents the completed staging image and bit 1 starts a new staging image with base ID zero. Other chunks name the preceding staging frame ID. Each of 1–64 patches contains `x: UInt16`, `y: UInt16`, `width: UInt16`, `height: UInt16`, `algorithm: UInt8` (0 LZ4, 1 LZFSE), `length: UInt32`, and the compressed packed BGRA bytes. Patches are nonempty, disjoint, and lie inside the negotiated dimensions.
+  - The receiver advertises `losslessVersion: 2` in `ReceiverHello`. Peers without that version continue over HEVC.
+  - **Progressive settle.** After 100 ms without a new capture, hash an 8×4 grid. Compress each changed tile with LZ4, also testing LZFSE if LZ4 exceeds 120,000 bytes and keeping the smaller result. Chunks are at most 3,500,000 bytes each including the wire header, with at most 28,000,000 bytes per settle. There is one outstanding chunk. The receiver ACKs each chunk and presents only the final snapshot, after all 32 tiles have arrived for a fresh settle.
+  - **Cached resync.** HEVC motion leaves the last acknowledged staging snapshot intact. Settle sends only tiles whose hashes differ. An unchanged image can be presented again using one pixel from its staging base. A new capture cancels unsent chunks. The sender starts fresh after an aborted partial transfer, route change, or lossless rejection.
+  - **Typing.** While exact content is presented, LZ4 patches can carry dirty rectangles covering up to 15% of the frame and 1.8 million pixels. The compressed patch budget is 512,000 bytes. Touched tiles with partially updated data are conservatively refreshed on the next cached settle.
 
 ### 3.4 Multi-Interface Discovery & Wired/Wireless Auto-Switch (`EndpointRanker.swift`, `LinkDiscovery.swift`)
 

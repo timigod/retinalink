@@ -19,7 +19,7 @@ final class WireProtocolTests: XCTestCase {
             .requestKeyframe,
             .disconnect(.init(reason: "Done")),
             .losslessFrame(.init(frameID: 4, captureTimeNs: 42, baseFrameID: 3, width: 4480, height: 2520,
-                                 algorithm: .lz4, patches: [.init(x: 16, y: 32, width: 64, height: 20,
+                                 present: true, resetsStaging: false, patches: [.init(x: 16, y: 32, width: 64, height: 20,
                                                                  compressedBytes: Data([1, 2, 3]))])),
         ]
     }
@@ -89,7 +89,7 @@ final class WireProtocolTests: XCTestCase {
 
     func testLosslessFrameRejectsMalformedFields() throws {
         let payload = try XCTUnwrap(messages.last).frame().payload
-        for (offset, value): (Int, UInt8) in [(24, 0), (28, 2), (29, 0), (29, 65), (30, 255), (38, 255)] {
+        for (offset, value): (Int, UInt8) in [(24, 0), (28, 4), (28, 2), (29, 0), (29, 65), (30, 255), (38, 255), (39, 255)] {
             var corrupt = payload
             corrupt[offset] = value
             if offset == 24 { corrupt[25] = 0 }
@@ -100,18 +100,35 @@ final class WireProtocolTests: XCTestCase {
         }
         let empty = LosslessPatch(x: 0, y: 0, width: 1, height: 1, compressedBytes: Data())
         let frame = LosslessFrame(frameID: 1, captureTimeNs: 2, baseFrameID: 0, width: 16, height: 16,
-                                  algorithm: .lzfse, patches: [empty])
+                                  present: true, resetsStaging: true, patches: [empty])
         XCTAssertThrowsError(try WireMessage.losslessFrame(frame).frame())
+    }
+
+    func testLosslessFrameRejectsOverlapAndOversizedChunk() throws {
+        let first = LosslessPatch(x: 0, y: 0, width: 16, height: 16, compressedBytes: Data([1]))
+        let overlap = LosslessPatch(x: 15, y: 0, width: 16, height: 16, algorithm: .lzfse, compressedBytes: Data([2]))
+        let oversized = LosslessPatch(x: 16, y: 0, width: 16, height: 16,
+                                      compressedBytes: Data(count: LosslessFrame.maxChunkBytes))
+        for invalid in [overlap, oversized] {
+            let frame = LosslessFrame(frameID: 4, captureTimeNs: 2, baseFrameID: 3, width: 32, height: 16,
+                                      present: false, resetsStaging: false, patches: [first, invalid])
+            XCTAssertThrowsError(try WireMessage.losslessFrame(frame).frame())
+        }
+        let frame = LosslessFrame(frameID: 4, captureTimeNs: 2, baseFrameID: 3, width: 32, height: 16,
+                                  present: true, resetsStaging: false, patches: [first,
+                                    .init(x: 16, y: 0, width: 16, height: 16, algorithm: .lzfse, compressedBytes: Data([2]))])
+        XCTAssertEqual(try WireMessage(frame: WireMessage.losslessFrame(frame).frame()), .losslessFrame(frame))
     }
 
     func testReceiverCapabilitiesAreOptionalForLegacyPeers() throws {
         let old = Data(#"{"name":"Display","panelPixelWidth":4480,"panelPixelHeight":2520}"#.utf8)
         let hello = try JSONDecoder().decode(ReceiverHello.self, from: old)
         XCTAssertNil(hello.supportsLossless)
+        XCTAssertFalse(hello.supportsProgressiveLossless)
         XCTAssertNil(hello.supportedProfiles)
         XCTAssertNil(hello.panelIsHiDPI)
         let updated = ReceiverHello(name: "Display", panelPixelWidth: 4480, panelPixelHeight: 2520, cursorPort: 58420,
-                                    supportsLossless: true, supportedProfiles: HEVCProfile.allCases,
+                                    losslessVersion: LosslessFrame.protocolVersion, supportedProfiles: HEVCProfile.allCases,
                                     physicalWidthMm: 522, physicalHeightMm: 294, panelIsHiDPI: true)
         XCTAssertEqual(try WireMessage(frame: WireMessage.receiverHello(updated).frame()), .receiverHello(updated))
     }

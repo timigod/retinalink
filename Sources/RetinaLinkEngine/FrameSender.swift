@@ -63,13 +63,15 @@ public final class FrameSender: @unchecked Sendable {
     }
 
     public let profile: HEVCProfile
-    public var isLosslessSettled: Bool { MediaQueue.sync { acknowledgedSettle != nil && settledFrameID != nil } }
+    public var isLosslessSettled: Bool { MediaQueue.sync { settledFrameID != nil } }
     public var linkSpeedMbps: Int? { MediaQueue.sync { active?.linkSpeedMbps } }
 
     private let losslessQueue = DispatchQueue(label: "RetinaLink.lossless", qos: .userInitiated)
     private var captureGeneration: UInt64 = 0
     private var settledFrameID: UInt64?
-    private var acknowledgedSettle: UInt64?
+    private var stagingFrameID: UInt64?
+    private var stagingTileHashes: [UInt64?] = []
+    private var transfer: LosslessTransfer?
     private var settleTimer: DispatchWorkItem?
     private var lastCaptureTime: UInt64 = 0
     private var losslessJob: UInt64?
@@ -117,7 +119,8 @@ public final class FrameSender: @unchecked Sendable {
                 case .frameAck(let ack): acknowledge(ack, on: route)
                 case .requestKeyframe:
                     if active === route {
-                        let rejectedLossless = self.settledFrameID != nil
+                        let rejectedLossless = transfer != nil || stagingFrameID != nil
+                        resetStaging()
                         requestKeyframe(skipSettleUntilNextCapture: rejectedLossless)
                     } else if pending === route {
                         requestKeyframe()
@@ -139,12 +142,13 @@ public final class FrameSender: @unchecked Sendable {
             lastSurface = surface
             lastCaptureTime = captureTimeNs
             guard let active else { return }
+            if transfer != nil { cancelTransfer() }
             let limit = BitrateController.maxInFlightFrames(for: active.kind, rttMs: active.session.smoothedRoundTripMs ?? .nan)
             if let base = settledFrameID, losslessJob == nil, pending == nil, inFlight < limit {
                 let dirty = DirtyRects(dirtyRects, width: CVPixelBufferGetWidth(surface.pixelBuffer),
                                        height: CVPixelBufferGetHeight(surface.pixelBuffer))
                 if dirty.fitsIncrementalBudget {
-                    compressLossless(surface, base: base, dirty: dirty, route: active)
+                    prepareLossless(surface, base: base, dirty: dirty, route: active)
                     return
                 }
             }
@@ -164,14 +168,13 @@ public final class FrameSender: @unchecked Sendable {
 
     private func clearSettle() {
         settledFrameID = nil
-        acknowledgedSettle = nil
         settleTimer?.cancel()
         settleTimer = nil
     }
 
     private func armSettle() {
         guard settleTimer == nil, settledFrameID == nil, active?.supportsLossless == true, pending == nil,
-              !needsKeyframe, lastSurface != nil, attemptedSettle != captureGeneration else { return }
+              !needsKeyframe, lastSurface != nil, transfer == nil, attemptedSettle != captureGeneration else { return }
         let generation = captureGeneration
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.captureGeneration == generation else { return }
@@ -179,57 +182,110 @@ public final class FrameSender: @unchecked Sendable {
             guard self.inFlight <= 1, self.order.isEmpty, self.losslessJob == nil,
                   let route = self.active, route.confirmed, let surface = self.lastSurface else { return }
             self.attemptedSettle = generation
-            self.compressLossless(surface, base: 0, dirty: nil, route: route)
+            self.prepareLossless(surface, base: self.stagingFrameID ?? 0, dirty: nil, route: route)
         }
         settleTimer = item
         let deadline = DispatchTime(uptimeNanoseconds: lastCaptureTime) + .milliseconds(100)
         MediaQueue.queue.asyncAfter(deadline: deadline, execute: item)
     }
 
-    private func compressLossless(_ surface: VideoSurface, base: UInt64, dirty: DirtyRects?, route: Route) {
+    private func prepareLossless(_ surface: VideoSurface, base: UInt64, dirty: DirtyRects?, route: Route) {
         let id = nextFrameID
-        nextFrameID &+= 1
+        nextFrameID += dirty == nil ? 32 : 1
         losslessJob = id
-        let generation = captureGeneration
-        let routeGeneration = self.generation
+        let capture = captureGeneration
+        let connectionGeneration = generation
         let time = lastCaptureTime
-        let kind = route.bitrate.linkKind
-        let speed = route.linkSpeedMbps
+        let hashes = stagingTileHashes
         losslessQueue.async { [weak self] in
             let started = DispatchTime.now().uptimeNanoseconds
-            let frame: LosslessFrame?
+            let chunks: [LosslessFrame]
+            let resultingHashes: [UInt64?]
             if let dirty {
-                frame = LosslessCodec.incremental(surface, frameID: id, captureTimeNs: time, baseFrameID: base, dirty: dirty)
+                chunks = LosslessCodec.incremental(surface, frameID: id, captureTimeNs: time, baseFrameID: base,
+                                                   dirty: dirty).map { [$0] } ?? []
+                let grid = LosslessTileGrid.rectangles(width: CVPixelBufferGetWidth(surface.pixelBuffer),
+                                                      height: CVPixelBufferGetHeight(surface.pixelBuffer))
+                // A dirty rect writes only part of each touched tile. Until a
+                // full tile arrives, its exact receiver-side hash is unknown.
+                resultingHashes = zip(grid, hashes).map { tile, hash in
+                    dirty.rects.contains(where: tile.overlaps) ? nil : hash
+                }
             } else {
-                frame = LosslessCodec.fullFrame(surface, frameID: id, captureTimeNs: time, linkKind: kind, linkSpeedMbps: speed)
+                let settle = LosslessCodec.settle(surface, firstFrameID: id, captureTimeNs: time,
+                                                  baseFrameID: base, previousHashes: hashes)
+                chunks = settle?.chunks ?? []
+                resultingHashes = settle?.hashes ?? []
             }
             let elapsed = UInt32(clamping: (DispatchTime.now().uptimeNanoseconds - started) / 1000)
             MediaQueue.queue.async { [weak self] in
                 guard let self, self.losslessJob == id else { return }
                 self.losslessJob = nil
-                guard self.active === route, self.generation == routeGeneration,
-                      self.captureGeneration == generation, self.pending == nil,
-                      !self.needsKeyframe, self.settledFrameID == (base == 0 ? nil : base) else {
+                guard self.active === route, self.generation == connectionGeneration,
+                      self.captureGeneration == capture, self.pending == nil, !self.needsKeyframe else {
                     self.armSettle()
                     return
                 }
-                guard let frame else {
-                    if base != 0 {
+                guard !chunks.isEmpty else {
+                    if dirty != nil {
                         let limit = BitrateController.maxInFlightFrames(for: route.kind,
                             rttMs: route.session.smoothedRoundTripMs ?? .nan)
                         self.resumeMotion(surface, captureTimeNs: time, limit: limit)
                     }
                     return
                 }
-                self._inFlight += 1
-                self._peakInFlight = max(self._peakInFlight, self._inFlight)
-                self._submittedFrames += 1
-                self.sent[id] = Outstanding(route: route, captureTimeNs: time, encodeUs: elapsed,
-                                            isKeyframe: false, isLossless: true)
-                self.settledFrameID = id
-                route.session.send(.losslessFrame(frame))
+                self.transfer = LosslessTransfer(chunks: chunks, hashes: resultingHashes, encodeUs: elapsed)
+                self.sendNextChunk(on: route)
             }
         }
+    }
+
+    private func sendNextChunk(on route: Route) {
+        guard let transfer, let frame = transfer.chunks.first else { return }
+        _inFlight += 1
+        _peakInFlight = max(_peakInFlight, _inFlight)
+        _submittedFrames += 1
+        sent[frame.frameID] = Outstanding(route: route, captureTimeNs: frame.captureTimeNs,
+                                         encodeUs: transfer.encodeUs, isKeyframe: false, isLossless: true)
+        route.session.send(.losslessFrame(frame))
+    }
+
+    private func acknowledgeLossless(_ ack: FrameAck, on route: Route) {
+        guard let transfer, let frame = transfer.chunks.first, frame.frameID == ack.frameID else { return }
+        guard ack.decodeUs > 0 else {
+            resetStaging()
+            requestKeyframe(skipSettleUntilNextCapture: true)
+            return
+        }
+        if frame.present {
+            stagingFrameID = frame.frameID
+            stagingTileHashes = transfer.hashes
+            settledFrameID = frame.frameID
+            self.transfer = nil
+        } else {
+            self.transfer?.chunks.removeFirst()
+            sendNextChunk(on: route)
+        }
+    }
+
+    private func cancelTransfer() {
+        guard transfer != nil else { return }
+        // One chunk may already have reached the peer. A new complete settle
+        // is the only safe base after aborting a partly transmitted image.
+        resetStaging()
+        clearSettle()
+    }
+
+    private func resetStaging() {
+        stagingFrameID = nil
+        stagingTileHashes.removeAll()
+        transfer = nil
+    }
+
+    private struct LosslessTransfer {
+        var chunks: [LosslessFrame]
+        let hashes: [UInt64?]
+        let encodeUs: UInt32
     }
 
     public func sendCursorImage(_ image: CursorImage) {
@@ -291,6 +347,7 @@ public final class FrameSender: @unchecked Sendable {
                 if let pending, encoded.frame.isKeyframe, first >= pending.switchFromFrameID {
                     if let retiring { detach(retiring, reason: "Route replaced") }
                     retiring = active
+                    resetStaging()
                     active = pending
                     _activeKind = pending.kind
                     try? encoder.updateBitrate(pending.bitrate.targetMbps)
@@ -324,7 +381,7 @@ public final class FrameSender: @unchecked Sendable {
         let measurement = FrameMeasurement(encodeUs: sentFrame.encodeUs, decodeUs: ack.decodeUs,
                                            deliveryMs: deliveryMs, receivedBytes: ack.receivedBytes)
         if ack.decodeUs > 0 {
-            readings.frames += 1
+            if !sentFrame.isLossless || transfer?.chunks.first?.present == true { readings.frames += 1 }
             readings.bytes += Int(ack.receivedBytes)
             readings.last = measurement
         }
@@ -338,9 +395,7 @@ public final class FrameSender: @unchecked Sendable {
             }
             adapt(route, now: now)
         }
-        if active === route, sentFrame.isLossless, ack.decodeUs > 0, settledFrameID != nil {
-            acknowledgedSettle = ack.frameID
-        }
+        if active === route, sentFrame.isLossless { acknowledgeLossless(ack, on: route) }
         replayForKeyframe()
         armSettle()
     }
@@ -365,6 +420,7 @@ public final class FrameSender: @unchecked Sendable {
 
     private func requestKeyframe(skipSettleUntilNextCapture: Bool = false) {
         captureGeneration &+= 1
+        cancelTransfer()
         if skipSettleUntilNextCapture { attemptedSettle = captureGeneration }
         clearSettle()
         needsKeyframe = true
@@ -406,6 +462,7 @@ public final class FrameSender: @unchecked Sendable {
 
     private func resetInFlight() {
         generation += 1
+        resetStaging()
         clearSettle()
         _inFlight = 0
         sent.removeAll()

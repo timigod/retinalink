@@ -107,13 +107,15 @@ public struct ReceiverHello: Codable, Equatable, Sendable {
     public let cursorPort: UInt16?
     public let ingressKind: LinkKind?
     public let supportsLossless: Bool?
+    public let losslessVersion: UInt8?
+    public var supportsProgressiveLossless: Bool { losslessVersion == LosslessFrame.protocolVersion }
     public let supportedProfiles: [HEVCProfile]?
     public let physicalWidthMm: Double?
     public let physicalHeightMm: Double?
     public let panelIsHiDPI: Bool?
 
     public init(name: String, panelPixelWidth: Int, panelPixelHeight: Int, cursorPort: UInt16?,
-                ingressKind: LinkKind? = nil, supportsLossless: Bool? = nil,
+                ingressKind: LinkKind? = nil, supportsLossless: Bool? = nil, losslessVersion: UInt8? = nil,
                 supportedProfiles: [HEVCProfile]? = nil, physicalWidthMm: Double? = nil,
                 physicalHeightMm: Double? = nil, panelIsHiDPI: Bool? = nil) {
         self.name = name
@@ -122,6 +124,7 @@ public struct ReceiverHello: Codable, Equatable, Sendable {
         self.cursorPort = cursorPort
         self.ingressKind = ingressKind
         self.supportsLossless = supportsLossless
+        self.losslessVersion = losslessVersion
         self.supportedProfiles = supportedProfiles
         self.physicalWidthMm = physicalWidthMm
         self.physicalHeightMm = physicalHeightMm
@@ -450,73 +453,91 @@ public enum LosslessAlgorithm: UInt8, Sendable {
 }
 
 public struct LosslessPatch: Equatable, Sendable {
+    package static let headerBytes = 13
     public let x: UInt16
     public let y: UInt16
     public let width: UInt16
     public let height: UInt16
+    public let algorithm: LosslessAlgorithm
     public let compressedBytes: Data
 
-    public init(x: UInt16, y: UInt16, width: UInt16, height: UInt16, compressedBytes: Data) {
+    public init(x: UInt16, y: UInt16, width: UInt16, height: UInt16, algorithm: LosslessAlgorithm = .lz4,
+                compressedBytes: Data) {
         self.x = x
         self.y = y
         self.width = width
         self.height = height
+        self.algorithm = algorithm
         self.compressedBytes = compressedBytes
     }
 
     public var rect: PixelRect { PixelRect(x: Int(x), y: Int(y), width: Int(width), height: Int(height)) }
+    package var payloadBytes: Int { Self.headerBytes + compressedBytes.count }
 }
 
 public struct LosslessFrame: Equatable, Sendable {
+    public static let protocolVersion: UInt8 = 2
+    package static let headerBytes = 30
+    package static let maxChunkBytes = 3_500_000
+    package static let maxSettleBytes = 28_000_000
     public let frameID: UInt64
     public let captureTimeNs: UInt64
     public let baseFrameID: UInt64
     public let width: UInt16
     public let height: UInt16
-    public let algorithm: LosslessAlgorithm
+    public let flags: UInt8
     public let patches: [LosslessPatch]
 
+    public var present: Bool { flags & 1 != 0 }
+    public var resetsStaging: Bool { flags & 2 != 0 }
+
     public init(frameID: UInt64, captureTimeNs: UInt64, baseFrameID: UInt64, width: UInt16, height: UInt16,
-                algorithm: LosslessAlgorithm, patches: [LosslessPatch]) {
+                present: Bool, resetsStaging: Bool, patches: [LosslessPatch]) {
         self.frameID = frameID
         self.captureTimeNs = captureTimeNs
         self.baseFrameID = baseFrameID
         self.width = width
         self.height = height
-        self.algorithm = algorithm
+        flags = (present ? 1 : 0) | (resetsStaging ? 2 : 0)
         self.patches = patches
     }
 
-    public var payloadBytes: Int { 30 + patches.reduce(0) { $0 + 12 + $1.compressedBytes.count } }
+    public var payloadBytes: Int { patches.reduce(Self.headerBytes) { $0 + $1.payloadBytes } }
 
     package var hasValidBounds: Bool {
-        width > 0 && height > 0 && (1...64).contains(patches.count) &&
-            patches.allSatisfy { patch in
-                patch.width > 0 && patch.height > 0 && patch.rect.maxX <= Int(width)
-                    && patch.rect.maxY <= Int(height) && !patch.compressedBytes.isEmpty
-            }
+        guard width > 0, height > 0, flags & 0xfc == 0, frameID > baseFrameID,
+              resetsStaging == (baseFrameID == 0), (1...64).contains(patches.count) else { return false }
+        let rects = patches.map(\.rect)
+        for (index, patch) in patches.enumerated() {
+            let rect = rects[index]
+            guard rect.width > 0, rect.height > 0, rect.maxX <= Int(width), rect.maxY <= Int(height),
+                  !patch.compressedBytes.isEmpty,
+                  !rects.suffix(from: index + 1).contains(where: rect.overlaps) else { return false }
+        }
+        return true
     }
 
     public func validate() throws {
+        guard payloadBytes <= min(WireFrame.maxPayloadSize, Self.maxChunkBytes - WireFrame.headerSize) else { throw WireError.oversizedPayload }
         guard hasValidBounds else { throw WireError.malformedPayload }
     }
 
     fileprivate func encoded() throws -> Data {
         try validate()
-        guard payloadBytes <= WireFrame.maxPayloadSize else { throw WireError.oversizedPayload }
         var writer = WireWriter(capacity: payloadBytes)
         writer.put(frameID)
         writer.put(captureTimeNs)
         writer.put(baseFrameID)
         writer.put(width)
         writer.put(height)
-        writer.put(algorithm.rawValue)
+        writer.put(flags)
         writer.put(UInt8(patches.count))
         for patch in patches {
             writer.put(patch.x)
             writer.put(patch.y)
             writer.put(patch.width)
             writer.put(patch.height)
+            writer.put(patch.algorithm.rawValue)
             writer.put(UInt32(patch.compressedBytes.count))
             writer.data.append(patch.compressedBytes)
         }
@@ -524,16 +545,14 @@ public struct LosslessFrame: Equatable, Sendable {
     }
 
     fileprivate init(decoding data: Data) throws {
+        guard data.count <= Self.maxChunkBytes - WireFrame.headerSize else { throw WireError.oversizedPayload }
         var reader = WireReader(data)
         frameID = try reader.get(UInt64.self)
         captureTimeNs = try reader.get(UInt64.self)
         baseFrameID = try reader.get(UInt64.self)
         width = try reader.get(UInt16.self)
         height = try reader.get(UInt16.self)
-        guard let algorithm = LosslessAlgorithm(rawValue: try reader.get(UInt8.self)) else {
-            throw WireError.malformedPayload
-        }
-        self.algorithm = algorithm
+        flags = try reader.get(UInt8.self)
         let count = try reader.get(UInt8.self)
         guard (1...64).contains(count) else { throw WireError.malformedPayload }
         var patches: [LosslessPatch] = []
@@ -542,8 +561,11 @@ public struct LosslessFrame: Equatable, Sendable {
             let y = try reader.get(UInt16.self)
             let width = try reader.get(UInt16.self)
             let height = try reader.get(UInt16.self)
+            guard let algorithm = LosslessAlgorithm(rawValue: try reader.get(UInt8.self)) else {
+                throw WireError.malformedPayload
+            }
             let length = try reader.get(UInt32.self)
-            patches.append(LosslessPatch(x: x, y: y, width: width, height: height,
+            patches.append(LosslessPatch(x: x, y: y, width: width, height: height, algorithm: algorithm,
                                          compressedBytes: try reader.take(Int(length))))
         }
         guard reader.remaining == 0 else { throw WireError.malformedPayload }

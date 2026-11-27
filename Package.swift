@@ -22,6 +22,6 @@ let package = Package(
         .executableTarget(name: "RetinaLinkBench", dependencies: ["RetinaLinkCore", "RetinaLinkEngine"]),
         .executableTarget(name: "RetinaLinkApp", dependencies: ["RetinaLinkEngine"]),
         .executableTarget(name: "RetinaLinkReceiverApp", dependencies: ["RetinaLinkEngine"]),
-        .testTarget(name: "RetinaLinkCoreTests", dependencies: ["RetinaLinkCore"]),
+        .testTarget(name: "RetinaLinkCoreTests", dependencies: ["RetinaLinkCore", "RetinaLinkEngine"]),
     ]
 )

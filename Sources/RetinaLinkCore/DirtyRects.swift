@@ -90,3 +90,17 @@ package enum CaptureDirtyRects {
             .filter { !$0.isNull && !$0.isEmpty }
     }
 }
+
+extension CaptureDirtyRects {
+    package static func lanczos(_ rects: [CGRect], sourceWidth: Int, sourceHeight: Int,
+                                outputWidth: Int, outputHeight: Int) -> [CGRect] {
+        guard sourceWidth > 0, sourceHeight > 0, outputWidth > 0, outputHeight > 0 else { return [] }
+        if sourceWidth == outputWidth && sourceHeight == outputHeight { return rects }
+        let sx = CGFloat(outputWidth) / CGFloat(sourceWidth)
+        let sy = CGFloat(outputHeight) / CGFloat(sourceHeight)
+        let transform = CGAffineTransform(scaleX: sx, y: sy)
+        let bounds = CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
+        return rects.map { $0.applying(transform).insetBy(dx: -4, dy: -4).integral.intersection(bounds) }
+            .filter { !$0.isNull && !$0.isEmpty }
+    }
+}

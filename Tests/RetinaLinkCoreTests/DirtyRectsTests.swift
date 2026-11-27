@@ -3,6 +3,18 @@ import RetinaLinkCore
 import XCTest
 
 final class DirtyRectsTests: XCTestCase {
+    func testLanczosMappingRoundsPadsAndClampsInOutputPixels() {
+        let input = CGRect(x: 3558, y: 2028, width: 160, height: 84)
+        XCTAssertEqual(CaptureDirtyRects.lanczos([input], sourceWidth: 3840, sourceHeight: 2160,
+                                               outputWidth: 4480, outputHeight: 2520),
+                       [CGRect(x: 4147, y: 2362, width: 195, height: 106)])
+        XCTAssertEqual(CaptureDirtyRects.lanczos([CGRect(x: 0, y: 1, width: 4, height: 3)],
+                                               sourceWidth: 5120, sourceHeight: 2880, outputWidth: 4480, outputHeight: 2520),
+                       [CGRect(x: 0, y: 0, width: 8, height: 8)])
+        XCTAssertEqual(CaptureDirtyRects.lanczos([input], sourceWidth: 4480, sourceHeight: 2520,
+                                                outputWidth: 4480, outputHeight: 2520), [input])
+    }
+
     func testNativeCaptureKeepsTopLeftOutputPixels() {
         let dirty = CGRect(x: 4198, y: 2388, width: 160, height: 84)
         XCTAssertEqual(CaptureDirtyRects.normalize([dirty], contentRect: CGRect(x: 0, y: 0, width: 2240, height: 1260),

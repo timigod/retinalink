@@ -74,6 +74,7 @@ public final class FrameReceiver: @unchecked Sendable {
                 session.send(.receiverHello(ReceiverHello(name: hello.name, panelPixelWidth: hello.panelPixelWidth,
                                                            panelPixelHeight: hello.panelPixelHeight, cursorPort: cursorPort,
                                                            ingressKind: ingress, supportsLossless: hello.supportsLossless,
+                                                           losslessVersion: hello.losslessVersion,
                                                            supportedProfiles: hello.supportedProfiles,
                                                            physicalWidthMm: hello.physicalWidthMm,
                                                            physicalHeightMm: hello.physicalHeightMm,
@@ -148,7 +149,7 @@ public final class FrameReceiver: @unchecked Sendable {
                 acknowledge(video, decodeUs: 0, on: session)
                 return
             }
-            resetLossless(connection)
+            connection.lastHEVCFrameID = video.frameID
             _submittedFrames += 1
             connection.lastSubmittedFrameID = video.frameID
             connection.needsKeyframe = false
@@ -182,7 +183,7 @@ public final class FrameReceiver: @unchecked Sendable {
     }
 
     private func receiveLossless(_ frame: LosslessFrame, connection: Connection) {
-        guard hello.supportsLossless == true, let config = connection.config,
+        guard hello.supportsProgressiveLossless, let config = connection.config,
               frame.frameID > connection.lastSubmittedFrameID, !connection.superseded else { return }
         connection.lastSubmittedFrameID = frame.frameID
         _submittedFrames += 1
@@ -195,7 +196,6 @@ public final class FrameReceiver: @unchecked Sendable {
             connection.lossless = LosslessWork(config: config)
         }
         guard let work = connection.lossless else { return }
-        connection.receivingLossless = true
         connection.pendingLossless += 1
         let epoch = connection.losslessEpoch
         work.queue.async { [weak self, weak connection] in
@@ -210,9 +210,10 @@ public final class FrameReceiver: @unchecked Sendable {
                     return
                 }
                 switch outcome {
-                case .decoded(let decoded):
-                    self.acknowledgeLossless(frame, decodeUs: decoded.decodeUs, on: connection.session)
-                    guard frame.frameID > connection.lastPresentedFrameID else { return }
+                case .applied(let decodeUs, let decoded):
+                    self.acknowledgeLossless(frame, decodeUs: decodeUs, on: connection.session)
+                    guard let decoded, frame.frameID > connection.lastPresentedFrameID,
+                          frame.frameID > connection.lastHEVCFrameID else { return }
                     connection.lastPresentedFrameID = frame.frameID
                     self.onFrame?(config, connection.session, .lossless(frame), decoded)
                 case .rejected(let reason):
@@ -224,8 +225,7 @@ public final class FrameReceiver: @unchecked Sendable {
     }
 
     private func resetLossless(_ connection: Connection) {
-        guard connection.receivingLossless, let work = connection.lossless else { return }
-        connection.receivingLossless = false
+        guard let work = connection.lossless else { return }
         connection.losslessEpoch &+= 1
         work.queue.async { work.reset() }
     }
@@ -320,7 +320,7 @@ public final class FrameReceiver: @unchecked Sendable {
         var decoder: HEVCDecoder?
         var lossless: LosslessWork?
         var pendingLossless = 0
-        var receivingLossless = false
+        var lastHEVCFrameID: UInt64 = 0
         var losslessEpoch: UInt64 = 0
         var needsKeyframe = true
         var superseded = false

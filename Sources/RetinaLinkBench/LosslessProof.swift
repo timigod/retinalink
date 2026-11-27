@@ -25,7 +25,7 @@ enum LosslessProof {
         let candidate = EndpointCandidate(kind: .thunderbolt, host: host, port: try args.port(default: 58430))
         let (session, hello) = try await SenderHandshake.open(candidate: candidate)
         defer { session.close() }
-        guard hello.name == name, hello.supportsLossless == true else {
+        guard hello.supportsProgressiveLossless, hello.panelPixelWidth == width, hello.panelPixelHeight == height else {
             throw RetinaLinkError.operation("Expected the isolated typography proof receiver")
         }
         let ingress = hello.ingressKind ?? candidate.kind
@@ -40,20 +40,31 @@ enum LosslessProof {
         sender.onError = { error in failure.update { $0 = error.localizedDescription } }
         session.send(.senderConfig(config))
         sender.attach(session, kind: ingress, receiverSupportsLossless: true)
+        let clock = ContinuousClock()
+        let start = clock.now
         sender.submit(baseline, captureTimeNs: DispatchTime.now().uptimeNanoseconds)
-        try await wait("full lossless ACK", failure: failure) { sender.isLosslessSettled && measurements.snapshot().count >= 2 }
-        sender.submit(update, captureTimeNs: DispatchTime.now().uptimeNanoseconds, dirtyRects: [crop])
-        try await wait("dirty rect ACK", failure: failure) { measurements.snapshot().count >= 3 }
-        sender.submit(baseline, captureTimeNs: DispatchTime.now().uptimeNanoseconds)
-        try await wait("return to HEVC", failure: failure) { measurements.snapshot().count >= 4 }
+        try await wait("full settle ACK", failure: failure) { sender.isLosslessSettled }
+        let first = measurements.snapshot()
+        sender.submit(update, captureTimeNs: DispatchTime.now().uptimeNanoseconds)
+        try await wait("cached settle ACK", failure: failure) {
+            sender.isLosslessSettled && measurements.snapshot().count >= first.count + 2
+        }
+        let second = measurements.snapshot()
+        sender.submit(baseline, captureTimeNs: DispatchTime.now().uptimeNanoseconds, dirtyRects: [crop])
+        try await wait("typing patch ACK", failure: failure) {
+            sender.isLosslessSettled && measurements.snapshot().count > second.count
+        }
         let samples = measurements.snapshot()
-        guard samples.prefix(4).allSatisfy({ $0.decodeUs > 0 }), sender.encodedFrames == 2 else {
-            throw RetinaLinkError.operation("Typography proof did not return four successful ACKs including two HEVC frames")
+        guard samples.allSatisfy({ $0.decodeUs > 0 }), sender.encodedFrames == 2 else {
+            throw RetinaLinkError.operation("Expected two HEVC frames and successful lossless ACKs")
         }
         print("Peer \(host):\(candidate.port), \(kind.displayName), local link speed \(sender.linkSpeedMbps.map(String.init) ?? "unknown") Mbps")
-        for (label, sample) in zip(["HEVC", "Full settle", "Dirty patch", "HEVC"], samples) {
-            print("\(label): encodeUs=\(sample.encodeUs) decodeUs=\(sample.decodeUs) wirePayloadBytes=\(sample.receivedBytes) captureToAckMs=\(sample.deliveryMs)")
+        for (label, phase) in [("Initial", Array(first.dropFirst())),
+                               ("Cached", Array(second.dropFirst(first.count + 1))),
+                               ("Typing", Array(samples.dropFirst(second.count)))] {
+            print("\(label): chunks=\(phase.count) encodeUs=\(phase.first?.encodeUs ?? 0) decodeTotalUs=\(phase.reduce(0) { $0 + Int($1.decodeUs) }) wireBytes=\(phase.reduce(0) { $0 + Int($1.receivedBytes) + WireFrame.headerSize }) captureToAckMs=\(phase.last?.deliveryMs ?? 0)")
         }
+        try await clock.sleep(until: start + .seconds(3))
     }
 
     static func receive(_ args: Arguments) async throws {
@@ -61,7 +72,7 @@ enum LosslessProof {
         let references = try Data(contentsOf: URL(fileURLWithPath: file))
         guard references.count == 64 else { throw RetinaLinkError.operation("Invalid typography reference hashes") }
         let hello = ReceiverHello(name: name, panelPixelWidth: width, panelPixelHeight: height, cursorPort: nil,
-                                  supportsLossless: true, supportedProfiles: HEVCDecoder.supportedHardwareProfiles())
+                                  losslessVersion: LosslessFrame.protocolVersion, supportedProfiles: HEVCDecoder.supportedHardwareProfiles())
         let receiver = FrameReceiver(hello: hello) { config, _ in config.name == name }
         let listener = LinkListener(name: name, width: width, height: height)
         defer { listener.stop(); receiver.dropConnections() }
@@ -75,20 +86,21 @@ enum LosslessProof {
         receiver.onError = { error in failure.update { $0 = error } }
         receiver.onFrame = { _, _, frame, decoded in received.update { $0.append((frame, decoded)) } }
         try listener.start(port: args.port(default: 58430))
-        try await wait("HEVC → settle → dirty patch → HEVC", seconds: 30, failure: failure) {
-            received.snapshot().count >= 4
+        try await wait("HEVC → settle → HEVC → cached settle → dirty patch", seconds: 30, failure: failure) {
+            received.snapshot().count >= 5
         }
         let frames = received.snapshot()
         guard case .hevc = frames[0].0, case .lossless(let settle) = frames[1].0,
-              case .lossless(let patch) = frames[2].0, case .hevc = frames[3].0,
-              settle.baseFrameID == 0, settle.patches.count == 4, settle.algorithm == .lz4,
-              patch.baseFrameID == settle.frameID, patch.algorithm == .lz4,
+              case .hevc = frames[2].0, case .lossless(let cached) = frames[3].0,
+              case .lossless(let patch) = frames[4].0,
+              settle.present, cached.present, patch.present, !cached.resetsStaging, !patch.resetsStaging,
+              patch.baseFrameID == cached.frameID, patch.patches.allSatisfy({ $0.algorithm == .lz4 }),
               patch.patches.map(\.rect) == DirtyRects([crop], width: width, height: height).rects else {
             throw RetinaLinkError.operation("Unexpected typography proof frame sequence")
         }
         let renderer = DisplayRendererView()
         renderer.frame = CGRect(x: 0, y: 0, width: width / 2, height: height / 2)
-        for (frame, decoded) in frames.prefix(4) {
+        for (frame, decoded) in frames.prefix(5) {
             let buffer = decoded.surface.pixelBuffer
             guard CVPixelBufferGetWidth(buffer) == width, CVPixelBufferGetHeight(buffer) == height,
                   CVPixelBufferGetIOSurface(buffer) != nil else {
@@ -103,17 +115,17 @@ enum LosslessProof {
             let fourCC = String(bytes: (0..<4).reversed().map { UInt8(truncatingIfNeeded: format >> ($0 * 8)) }, encoding: .ascii)
             print("frame=\(frame.frameID) IOSurface=\(fourCC ?? "?") decodeUs=\(decoded.decodeUs)")
         }
-        for (index, frame) in [settle, patch].enumerated() {
-            let decoded = frames[index + 1].1
+        for (index, frame, reference) in [(1, settle, 0), (3, cached, 1), (4, patch, 0)] {
+            let decoded = frames[index].1
             let buffer = decoded.surface.pixelBuffer
             guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
                   let taggedColorSpace = CVBufferCopyAttachment(buffer, kCVImageBufferCGColorSpaceKey, nil),
                   CFEqual(taggedColorSpace, p3),
-                  digest(decoded.surface) == references.subdata(in: (index * 32)..<((index + 1) * 32)) else {
+                  digest(decoded.surface) == references.subdata(in: (reference * 32)..<((reference + 1) * 32)) else {
                 throw RetinaLinkError.operation("Full desktop pixel digest mismatch for frame \(frame.frameID)")
             }
             let bytes = frame.patches.reduce(0) { $0 + $1.compressedBytes.count }
-            print("frame=\(frame.frameID) patches=\(frame.patches.count) LZ4Bytes=\(bytes) maxRGBError=0/255 exactBGRA=100.00%")
+            print("frame=\(frame.frameID) patches=\(frame.patches.count) finalChunkCompressedBytes=\(bytes) maxRGBError=0/255 exactBGRA=100.00%")
         }
     }
 
